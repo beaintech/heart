@@ -5,21 +5,38 @@ import { Camera } from "@mediapipe/camera_utils";
 
 const video = document.getElementById("video");
 const canvas = document.getElementById("c");
+const overlay = document.getElementById("overlay");
+let score = 0;
+const scoreEl = document.getElementById("score");
+const updateScore = () => { if (scoreEl) scoreEl.textContent = String(score); };
+updateScore();
 
 // ---------- three.js scene ----------
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setClearColor(0x000000, 0);
 
+const ctx2d = overlay.getContext("2d");
+
 const scene = new THREE.Scene();
 const cam3d = new THREE.PerspectiveCamera(55, 1, 0.01, 50);
 cam3d.position.set(0, 0, 4.2);
 
 function resize() {
+  const dpr = Math.min(devicePixelRatio, 2);
+
+  renderer.setPixelRatio(dpr);
   renderer.setSize(innerWidth, innerHeight, false);
+
+  overlay.width = Math.floor(innerWidth * dpr);
+  overlay.height = Math.floor(innerHeight * dpr);
+  overlay.style.width = innerWidth + "px";
+  overlay.style.height = innerHeight + "px";
+
   cam3d.aspect = innerWidth / innerHeight;
   cam3d.updateProjectionMatrix();
 }
+
 addEventListener("resize", resize);
 resize();
 
@@ -272,7 +289,75 @@ hands.setOptions({
   minTrackingConfidence: 0.6
 });
 
+let lastHands = null;
+function drawHandOverlay() {
+  const dpr = Math.min(devicePixelRatio, 2);
+
+  ctx2d.setTransform(1, 0, 0, 1, 0, 0);
+  ctx2d.clearRect(0, 0, overlay.width, overlay.height);
+
+  ctx2d.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  if (!lastHands?.multiHandLandmarks?.length) return;
+
+  const w = innerWidth;
+  const h = innerHeight;
+
+  ctx2d.save();
+  ctx2d.globalCompositeOperation = "source-over";
+  ctx2d.lineWidth = 3;
+  ctx2d.strokeStyle = "rgba(0,255,180,0.95)";
+  ctx2d.fillStyle = "rgba(0,255,180,0.95)";
+
+  // 你的 video 是镜像的，所以骨架也镜像，才能和心形/画面一致
+  const mx = (x) => (1 - x) * w;
+  const my = (y) => y * h;
+
+  const drawLine = (a, b) => {
+    ctx2d.beginPath();
+    ctx2d.moveTo(mx(a.x), my(a.y));
+    ctx2d.lineTo(mx(b.x), my(b.y));
+    ctx2d.stroke();
+  };
+
+  const drawDot = (p) => {
+    ctx2d.beginPath();
+    ctx2d.arc(mx(p.x), my(p.y), 3.2, 0, Math.PI * 2);
+    ctx2d.fill();
+  };
+
+  const fingers = [
+    [0, 1, 2, 3, 4],      // thumb
+    [0, 5, 6, 7, 8],      // index
+    [0, 9, 10, 11, 12],   // middle
+    [0, 13, 14, 15, 16],  // ring
+    [0, 17, 18, 19, 20]   // pinky
+  ];
+
+  for (const lm of lastHands.multiHandLandmarks) {
+    // dots
+    for (let i = 0; i < lm.length; i++) drawDot(lm[i]);
+
+    // palm connections
+    drawLine(lm[0], lm[5]);
+    drawLine(lm[0], lm[9]);
+    drawLine(lm[0], lm[13]);
+    drawLine(lm[0], lm[17]);
+    drawLine(lm[5], lm[9]);
+    drawLine(lm[9], lm[13]);
+    drawLine(lm[13], lm[17]);
+
+    // finger bones
+    for (const f of fingers) {
+      for (let i = 0; i < f.length - 1; i++) drawLine(lm[f[i]], lm[f[i + 1]]);
+    }
+  }
+
+  ctx2d.restore();
+}
+
 hands.onResults((results) => {
+  lastHands = results;
   const lms = results.multiHandLandmarks || [];
   const handed = results.multiHandedness || [];
 
@@ -461,12 +546,15 @@ function tick(t) {
     hideTimerL = MERGE_HIDE_SECONDS;
     hideTimerR = MERGE_HIDE_SECONDS;
 
+      score += 10;
+      updateScore();
+
     mergeCooldown = MERGE_HIDE_SECONDS + 0.35;
   }
 }
-
   updateBrush(dt);
   renderer.render(scene, cam3d);
+  drawHandOverlay();
 }
 
 requestAnimationFrame(tick);
