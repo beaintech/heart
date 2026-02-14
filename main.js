@@ -1,3 +1,4 @@
+// main.js
 import * as THREE from "three";
 import { Hands } from "@mediapipe/hands";
 import { Camera } from "@mediapipe/camera_utils";
@@ -8,17 +9,17 @@ const canvas = document.getElementById("c");
 // ---------- three.js scene ----------
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-renderer.setClearColor(0x000000, 0); // 透明背景
+renderer.setClearColor(0x000000, 0);
 
 const scene = new THREE.Scene();
 const cam3d = new THREE.PerspectiveCamera(55, 1, 0.01, 50);
-cam3d.position.set(0, 0, 3.2);
+cam3d.position.set(0, 0, 4.2);
 
-const resize = () => {
+function resize() {
   renderer.setSize(innerWidth, innerHeight, false);
   cam3d.aspect = innerWidth / innerHeight;
   cam3d.updateProjectionMatrix();
-};
+}
 addEventListener("resize", resize);
 resize();
 
@@ -31,12 +32,12 @@ scene.add(dir);
 // ---------- HeartShape Extrude ----------
 function makeHeartShape() {
   const pts = [];
-  const N = 240;
+  const N = 260;
+  const sx = 0.045;
+  const sy = 0.045;
 
-  // 经典心形曲线（数学公式），再缩放到 three.js 里好用的尺寸
   for (let i = 0; i <= N; i++) {
     const t = (i / N) * Math.PI * 2;
-
     const x = 16 * Math.pow(Math.sin(t), 3);
     const y =
       13 * Math.cos(t) -
@@ -44,131 +45,140 @@ function makeHeartShape() {
       2 * Math.cos(3 * t) -
       1 * Math.cos(4 * t);
 
-    // 缩放 + 轻微拉高，让顶部凹口更像你要的那种
-    const sx = 0.045;      // 宽度缩放
-    const sy = 0.045;      // 高度缩放
-    pts.push(new THREE.Vector2(x * sx, y * sy));
+    // y 取反让凹口在上、尖在下（更直觉）
+    pts.push(new THREE.Vector2(x * sx, -y * sy));
   }
 
-  const shape = new THREE.Shape(pts);
+  // 顶部凹口再压一点
   for (let i = 0; i < pts.length; i++) {
     const p = pts[i];
     const nearTop = p.y > 0.35;
     const nearCenter = Math.abs(p.x) < 0.12;
     if (nearTop && nearCenter) p.y -= 0.03;
   }
+
   return new THREE.Shape(pts);
 }
 
 const heartShape = makeHeartShape();
 const heartGeo = new THREE.ExtrudeGeometry(heartShape, {
-  depth: 0.35,
+  depth: 0.28,
   bevelEnabled: true,
-  bevelThickness: 0.08,
-  bevelSize: 0.06,
-  bevelSegments: 6,
-  curveSegments: 40
+  bevelThickness: 0.06,
+  bevelSize: 0.05,
+  bevelSegments: 8,
+  curveSegments: 80
 });
 heartGeo.center();
-heartGeo.rotateZ(Math.PI); 
+// 这一行是“统一翻正”的开关：你现在倒的情况就需要它
+heartGeo.rotateZ(Math.PI);
 
-const heartMat = new THREE.MeshStandardMaterial({
+const baseMat = new THREE.MeshStandardMaterial({
   color: 0xff2f6d,
   metalness: 0.25,
   roughness: 0.22,
   emissive: 0x240010,
   emissiveIntensity: 0.35,
-  transparent: true // 给 brush hearts 做淡出
+  transparent: true
 });
 
-// main heart
-const heart = new THREE.Mesh(heartGeo, heartMat.clone());
-scene.add(heart);
+// two main hearts (pink + red/purple)
+const matL = baseMat.clone();
+matL.color.setHex(0xff2f6d);
+const matR = baseMat.clone();
+matR.color.setHex(0xff5fd3);
 
-// ---------- Brush hearts ----------
+const heartL = new THREE.Mesh(heartGeo, matL);
+const heartR = new THREE.Mesh(heartGeo, matR);
+scene.add(heartL, heartR);
+
+// ---------- projection helpers ----------
+const raycaster = new THREE.Raycaster();
+const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+const tmpV3 = new THREE.Vector3();
+
+function screenToWorld(xNorm, yNorm) {
+  // video CSS 已镜像(scaleX(-1))，所以这里用 1-x 保持“右手=右边”
+  const x = 1 - xNorm;
+  const ndc = new THREE.Vector2(x * 2 - 1, -(yNorm * 2 - 1));
+  raycaster.setFromCamera(ndc, cam3d);
+  raycaster.ray.intersectPlane(plane, tmpV3);
+  return tmpV3.clone();
+}
+
+const dist2D = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const lerp = (a, b, t) => a + (b - a) * t;
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+// ---------- state (per heart) ----------
+const HEART_MEDIUM_L = 0.55;
+const HEART_MEDIUM_R = 0.55;
+
+let targetScaleL = HEART_MEDIUM_L, smoothScaleL = HEART_MEDIUM_L;
+let targetScaleR = HEART_MEDIUM_R, smoothScaleR = HEART_MEDIUM_R;
+
+let targetPosL = new THREE.Vector3(-0.6, 0, 0), smoothPosL = targetPosL.clone();
+let targetPosR = new THREE.Vector3(0.6, 0, 0),  smoothPosR = targetPosR.clone();
+
+let prevHeartPosL = targetPosL.clone(), prevHeartPosR = targetPosR.clone();
+let trailAccL = 0, trailAccR = 0;
+
+let hideTimerL = 0, hideTimerR = 0;
+
+// blow burst
+let burstCooldown = 0;
+
+// fusion burst (two hearts close)
+let mergeCooldown = 0;
+const MERGE_DISTANCE = 0.45;
+const MERGE_HIDE_SECONDS = 1.0;
+
+// ---------- Brush hearts (tail + burst) ----------
 const brushGroup = new THREE.Group();
 scene.add(brushGroup);
 
 const MAX_BRUSH = 1400;
-const brush = []; // {mesh, vel:Vector3, life, ttl, baseScale}
+const brush = []; // {mesh, vel, life, ttl, baseScale}
 
-function addBrushHeart(pos, velOverride = null) {
+function addBrushHeart(pos, velOverride = null, colorHex = 0xff2f6d, sizeMul = 1.0) {
   if (brush.length >= MAX_BRUSH) return;
 
-  const m = new THREE.Mesh(heartGeo, heartMat.clone());
+  const m = new THREE.Mesh(heartGeo, baseMat.clone());
+  m.material.color.setHex(colorHex);
   m.position.copy(pos);
 
-  const s = 0.07 + Math.random() * 0.06;
+const base = 0.26 + Math.random() * 0.12;
+  const s = base * sizeMul;                   // 关键：乘动态倍率
   m.scale.setScalar(s);
 
   m.rotation.set(
+    (Math.random() - 0.5) * 0.4,
     (Math.random() - 0.5) * 0.6,
-    (Math.random() - 0.5) * 0.9,
-    (Math.random() - 0.5) * 0.9
+    (Math.random() - 0.5) * 0.6
   );
-  m.rotation.z += Math.PI;
 
   const vel = velOverride
-  ? velOverride.clone()
-  : new THREE.Vector3(
-      (Math.random() - 0.5) * 0.02,
-      0.03 + Math.random() * 0.05,
-      (Math.random() - 0.5) * 0.015
-    );
+    ? velOverride.clone()
+    : new THREE.Vector3(
+        (Math.random() - 0.5) * 0.02,
+        0.03 + Math.random() * 0.05,
+        (Math.random() - 0.5) * 0.015
+      );
 
-  // 生命周期
-    const ttl = 1.5 + Math.random() * 2.5;
-  const item = { mesh: m, vel, life: 0, ttl, baseScale: s };
-
+  const ttl = 0.55 + Math.random() * 0.45;
   brushGroup.add(m);
-  brush.push(item);
+  brush.push({ mesh: m, vel, life: 0, ttl, baseScale: s });
 }
 
 function updateBrush(dt) {
-  // 从后往前删，省事
-  for (let i = brush.length - 1; i >= 0; i--) {
-    const b = brush[i];
-    b.life += dt;
-
-    const t = Math.min(1, b.life / b.ttl);
-
-    // 漂浮
-    b.mesh.position.addScaledVector(b.vel, dt);
-
-    // 轻微自转
-    b.mesh.rotation.x += dt * 0.8;
-    b.mesh.rotation.y += dt * 1.1;
-
-    // 缩小 + 淡出
-    const s = b.baseScale * (1 - 0.55 * t);
-    b.mesh.scale.setScalar(Math.max(0.001, s));
-
-    b.mesh.material.opacity = 1 - (t * t);
-
-    // 到期清理
-    if (t >= 1) {
-      brushGroup.remove(b.mesh);
-      b.mesh.geometry.dispose(); // geometry 共享也可以不 dispose，这里用同一个 heartGeo，会重复 dispose
-      // 所以上面这一行要删掉，避免把共享 geometry 释放掉
-      // 正确做法：只 dispose material
-      b.mesh.material.dispose();
-      brush.splice(i, 1);
-    }
-  }
-}
-
-// 注意：heartGeo 是共享的，不要在每个 brush heart 删除时 dispose geometry
-// 所以上面 updateBrush 里那行 b.mesh.geometry.dispose() 必须确保没执行
-// 我在下面直接覆盖 updateBrush 中的那行逻辑：不 dispose geometry（已在上面注释）
-function safeUpdateBrush(dt) {
   for (let i = brush.length - 1; i >= 0; i--) {
     const b = brush[i];
     b.life += dt;
     const t = Math.min(1, b.life / b.ttl);
 
     b.mesh.position.addScaledVector(b.vel, dt);
-    b.mesh.rotation.x += dt * 0.8;
-    b.mesh.rotation.y += dt * 1.1;
+    b.mesh.rotation.x += dt * 0.6;
+    b.mesh.rotation.y += dt * 0.8;
 
     const s = b.baseScale * (1 - 0.55 * t);
     b.mesh.scale.setScalar(Math.max(0.001, s));
@@ -182,110 +192,124 @@ function safeUpdateBrush(dt) {
   }
 }
 
-// ---------- 2D -> 3D projection ----------
-const raycaster = new THREE.Raycaster();
-const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0); // z=0 plane
-const tmpV3 = new THREE.Vector3();
+// tail generator
+function spawnTrailForHeart(heartMesh, prevPos, setAcc, accValue, colorHex) {
+  const move = heartMesh.position.clone().sub(prevPos);
+  const moved = move.length();
+  const spacing = 0.11; // bigger = less sensitive
+  accValue += moved;
 
-function screenToWorld(xNorm, yNorm) {
-  const x = 1 - xNorm; // 修正镜像：右边->右边
-  const ndc = new THREE.Vector2(x * 2 - 1, -(yNorm * 2 - 1));
-  raycaster.setFromCamera(ndc, cam3d);
-  raycaster.ray.intersectPlane(plane, tmpV3);
-  return tmpV3.clone();
+  if (moved > 1e-6) {
+    const dir = move.clone().normalize();
+    while (accValue > spacing) {
+      accValue -= spacing;
+      const spawnPos = heartMesh.position.clone().add(dir.clone().multiplyScalar(-0.14));
+      const vel = new THREE.Vector3(
+        (Math.random() - 0.5) * 0.02,
+        0.02 + Math.random() * 0.04,
+        (Math.random() - 0.5) * 0.015
+      ).add(dir.clone().multiplyScalar(-0.10));
+      addBrushHeart(spawnPos, vel, colorHex);
+    }
+  }
+
+  prevPos.copy(heartMesh.position);
+  setAcc(accValue);
 }
 
-// ---------- gesture helpers ----------
-const dist2D = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
-const lerp = (a, b, t) => a + (b - a) * t;
-const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+// ---------- Targets (optional fun background; remove if you don't want) ----------
+const targetGroup = new THREE.Group();
+scene.add(targetGroup);
 
-// ---------- state ----------
-let pinch = false;
-const HEART_MEDIUM = 0.35;
-let lastDrawPos = null;
-let smoothedDrawPos = null;
-let drawCooldown = 0; // seconds
-let targetPos = new THREE.Vector3(0, 0, 0);
-let smoothPos = new THREE.Vector3(0, 0, 0);
+const targets = []; // { mesh, vel }
+const MAX_TARGETS = 18;
 
-let prevHeartPos = new THREE.Vector3(0, 0, 0);
-let trailAccumulator = 0;
-let burstCooldown = 0;
-let heartHideTimer = 0;
-let targetScale = HEART_MEDIUM;
-let smoothScale = HEART_MEDIUM;
+function spawnTarget() {
+  if (targets.length >= MAX_TARGETS) return;
 
+  const m = new THREE.Mesh(heartGeo, baseMat.clone());
+  m.material.color.setHex(Math.random() < 0.5 ? 0xffc0d9 : 0xd6c7ff);
+
+  const s = 0.08 + Math.random() * 0.05;
+  m.scale.setScalar(s);
+
+  const x = (Math.random() * 2 - 1) * 1.45;
+  const y = (Math.random() * 2 - 1) * 0.95;
+  m.position.set(x, y, 0);
+
+  m.rotation.set(0.25, 0, 0);
+
+  const vel = new THREE.Vector3(
+    (Math.random() - 0.5) * 0.16,
+    (Math.random() - 0.5) * 0.12,
+    0
+  );
+
+  targetGroup.add(m);
+  targets.push({ mesh: m, vel });
+}
+
+function updateTargets(dt) {
+  for (let i = targets.length - 1; i >= 0; i--) {
+    const t = targets[i];
+    t.mesh.position.addScaledVector(t.vel, dt);
+
+    if (t.mesh.position.x > 1.55 || t.mesh.position.x < -1.55) t.vel.x *= -1;
+    if (t.mesh.position.y > 0.95 || t.mesh.position.y < -0.95) t.vel.y *= -1;
+
+    t.mesh.rotation.y += dt * 0.6;
+  }
+}
 
 // ---------- MediaPipe Hands ----------
 const hands = new Hands({
   locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
 });
 hands.setOptions({
-  maxNumHands: 1,
+  maxNumHands: 2,
   modelComplexity: 1,
   minDetectionConfidence: 0.6,
   minTrackingConfidence: 0.6
 });
 
 hands.onResults((results) => {
-  if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
-    pinch = false;
-    lastDrawPos = null;
+  const lms = results.multiHandLandmarks || [];
+  const handed = results.multiHandedness || [];
+
+  if (lms.length === 0) {
+    targetScaleL = HEART_MEDIUM_L;
+    targetScaleR = HEART_MEDIUM_R;
     return;
   }
 
-  const lm = results.multiHandLandmarks[0];
-  const thumbTip = lm[4];
-  const indexTip = lm[8];
+  for (let i = 0; i < lms.length; i++) {
+    const lm = lms[i];
+    const label = handed[i]?.label || "Right"; // Left / Right
 
-  const p0 = lm[0];
-    const p5 = lm[5];
-    const p9 = lm[9];
-    const p13 = lm[13];
-    const p17 = lm[17];
+    const thumbTip = lm[4];
+    const indexTip = lm[8];
 
+    const d = dist2D(thumbTip, indexTip);
+    const dNorm = clamp((d - 0.02) / (0.18 - 0.02), 0, 1);
+
+    const p0 = lm[0], p5 = lm[5], p9 = lm[9], p13 = lm[13], p17 = lm[17];
     const cx = (p0.x + p5.x + p9.x + p13.x + p17.x) / 5;
     const cy = (p0.y + p5.y + p9.y + p13.y + p17.y) / 5;
+    const worldPos = screenToWorld(cx, cy);
 
-    targetPos = screenToWorld(cx, cy);
+    const scale = lerp(0.18, 1.35, dNorm);
 
-  const d = dist2D(thumbTip, indexTip);
-  pinch = d < 0.045;
-
-  // pinch distance -> main heart scale
-  const dNorm = clamp((d - 0.02) / (0.12 - 0.02), 0, 1);
-  targetScale = lerp(0.1, 0.5, dNorm);
-
-  // draw brush hearts when not pinching
-  if (!pinch) {
-    const p = screenToWorld(indexTip.x, indexTip.y);
-    if (!smoothedDrawPos) smoothedDrawPos = p.clone();
-    smoothedDrawPos.lerp(p, 0.22); // 越小越慢：0.15 更钝，0.3 更跟手
-
-    if (lastDrawPos) {
-      const step = 0.075; // 越小越密
-      const delta = p.clone().sub(lastDrawPos);
-      const len = delta.length();
-      const n = Math.min(45, Math.floor(len / step));
-
-    //   for (let i = 0; i < n; i++) {
-    //     const t = (i + 1) / (n + 1);
-    //     const q = lastDrawPos.clone().add(delta.clone().multiplyScalar(t));
-    //     addBrushHeart(q);
-    //   }
+    if (label === "Left") {
+      targetPosL.copy(worldPos);
+      targetScaleL = scale;
     } else {
-      addBrushHeart(p);
+      targetPosR.copy(worldPos);
+      targetScaleR = scale;
     }
-
-    lastDrawPos = p;
-    drawCooldown = 0.05; // 50ms 一次，想更慢就 0.08 / 0.12
-  } else {
-    lastDrawPos = null;
-    smoothedDrawPos = null;
   }
 });
 
+// ---------- Mic blow detection ----------
 let audioLevel = 0;
 
 async function initMic() {
@@ -300,22 +324,19 @@ async function initMic() {
 
   function loop() {
     analyser.getByteTimeDomainData(data);
-    // RMS 音量
     let sum = 0;
     for (let i = 0; i < data.length; i++) {
       const v = (data[i] - 128) / 128;
       sum += v * v;
     }
-    const rms = Math.sqrt(sum / data.length);
-    audioLevel = rms; // 典型 0.01~0.08，吹气会更高
+    audioLevel = Math.sqrt(sum / data.length);
     requestAnimationFrame(loop);
   }
   loop();
 }
 initMic();
 
-
-// webcam init
+// ---------- webcam init ----------
 async function initCam() {
   const stream = await navigator.mediaDevices.getUserMedia({
     video: { facingMode: "user" },
@@ -335,6 +356,22 @@ async function initCam() {
 }
 initCam();
 
+// ---------- bursts ----------
+function burstAt(pos, colorHex, count = 160, sizeMul = 1.0) {
+  for (let i = 0; i < count; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const up = 0.2 + Math.random() * 0.7;
+
+    const vel = new THREE.Vector3(
+      Math.cos(a) * (0.65 + Math.random() * 1.25),
+      up + (Math.random() * 0.45),
+      Math.sin(a) * (0.65 + Math.random() * 1.25)
+    ).multiplyScalar(1.35);
+
+    addBrushHeart(pos.clone(), vel, colorHex, sizeMul);
+  }
+}
+
 // ---------- render loop ----------
 let lastT = performance.now();
 
@@ -343,82 +380,92 @@ function tick(t) {
   const dt = Math.min(0.033, (t - lastT) / 1000);
   lastT = t;
 
-  smoothScale = lerp(smoothScale, targetScale, 0.18);
-  heart.scale.setScalar(smoothScale);
-
-  heart.rotation.x = 0.25;  
-  heart.rotation.z = Math.PI;
-  heart.rotation.y += 0.9 * dt;
-
-  drawCooldown = Math.max(0, drawCooldown - dt);
-smoothPos.lerp(targetPos, 0.18); // 越小越“顿”，0.12 更慢，0.25 更跟手
-heart.position.copy(smoothPos);
-
-// 尾迹：跟着大心形走（按位移距离生成，避免太敏感）
-const move = heart.position.clone().sub(prevHeartPos);
-const speed = move.length() / Math.max(dt, 1e-6);
-
-// 每移动一定距离生成一个小心形
-const spacing = 0.09; // 越大越稀疏
-trailAccumulator += move.length();
-
-heartHideTimer = Math.max(0, heartHideTimer - dt);
-heart.visible = heartHideTimer <= 0;
-
-
-while (trailAccumulator > spacing) {
-  trailAccumulator -= spacing;
-
-  // 在大心形后方一点点生成（沿着运动反方向）
-  const dir = move.length() > 1e-6 ? move.clone().normalize() : new THREE.Vector3(0, 1, 0);
-  const spawnPos = heart.position.clone().add(dir.multiplyScalar(-0.12));
-
-  // 尾迹速度：轻微向后 + 轻微上飘
-  const vel = new THREE.Vector3(
-    (Math.random() - 0.5) * 0.02,
-    0.02 + Math.random() * 0.04,
-    (Math.random() - 0.5) * 0.015
-  ).add(dir.multiplyScalar(-0.06 - Math.min(0.12, speed * 0.01)));
-
-  addBrushHeart(spawnPos, vel);
-
   burstCooldown = Math.max(0, burstCooldown - dt);
+  mergeCooldown = Math.max(0, mergeCooldown - dt);
 
-// 吹气阈值：你可以调 0.055 / 0.07
-const blowThreshold = 0.06;
+  hideTimerL = Math.max(0, hideTimerL - dt);
+  hideTimerR = Math.max(0, hideTimerR - dt);
 
-if (audioLevel > blowThreshold && burstCooldown <= 0) {
-  burstCooldown = 0.7; // 防连发
+  heartL.visible = hideTimerL <= 0;
+  heartR.visible = hideTimerR <= 0;
 
-  // 吹散时：主心形短暂消失 + 回来变小
-  heartHideTimer = 2;        // 消失 180ms，你想更久就 0.25/0.35
-  targetScale = HEART_MEDIUM * 0.45; // 回来小一点（0.65 可调 0.5~0.8）
+  // smooth follow
+  smoothPosL.lerp(targetPosL, 0.18);
+  smoothPosR.lerp(targetPosR, 0.18);
+  heartL.position.copy(smoothPosL);
+  heartR.position.copy(smoothPosR);
 
-  // 在大心形当前位置爆炸出很多小心形
-  const count = 140; // 越大越炸
-  for (let i = 0; i < count; i++) {
-    const angle = Math.random() * Math.PI * 2;
-    const up = (Math.random() - 0.2) * 0.6;
+  // smooth scale
+  smoothScaleL = lerp(smoothScaleL, targetScaleL, 0.18);
+  smoothScaleR = lerp(smoothScaleR, targetScaleR, 0.18);
+  heartL.scale.setScalar(smoothScaleL);
+  heartR.scale.setScalar(smoothScaleR);
 
-    const vel = new THREE.Vector3(
-      Math.cos(angle) * (0.25 + Math.random() * 0.55),
-      up + (0.15 + Math.random() * 0.45),
-      Math.sin(angle) * (0.25 + Math.random() * 0.55)
+  // fixed pose
+  heartL.rotation.set(0.25, 0, 0);
+  heartR.rotation.set(0.25, 0, 0);
+
+  // tails (only when visible)
+  if (heartL.visible) {
+    spawnTrailForHeart(heartL, prevHeartPosL, (v) => (trailAccL = v), trailAccL, 0xff2f6d);
+  } else {
+    prevHeartPosL.copy(heartL.position);
+    trailAccL = 0;
+  }
+  if (heartR.visible) {
+    spawnTrailForHeart(heartR, prevHeartPosR, (v) => (trailAccR = v), trailAccR, 0xff5fd3);
+  } else {
+    prevHeartPosR.copy(heartR.position);
+    trailAccR = 0;
+  }
+
+  // optional targets
+  if (Math.random() < dt * 1.6) spawnTarget();
+  updateTargets(dt);
+
+  // blow -> burst (both hearts) + hide longer
+  const blowThreshold = 0.06;
+  if (audioLevel > blowThreshold && burstCooldown <= 0) {
+    burstCooldown = 0.7;
+
+  const sizeMulL = clamp(smoothScaleL / HEART_MEDIUM_L, 0.7, 2.6);
+  const sizeMulR = clamp(smoothScaleR / HEART_MEDIUM_R, 0.7, 2.6);
+
+  burstAt(heartL.position, 0xff2f6d, 320, sizeMulL);
+  burstAt(heartR.position, 0xff5fd3, 320, sizeMulR);
+
+    hideTimerL = 2.0;
+    hideTimerR = 2.0;
+
+    targetScaleL = HEART_MEDIUM_L * 0.65;
+    targetScaleR = HEART_MEDIUM_R * 0.65;
+  }
+
+  // fusion: when two hearts close -> one big burst at mid + hide both for 2s -> respawn
+  const bothVisible = (hideTimerL <= 0) && (hideTimerR <= 0);
+  if (bothVisible && mergeCooldown <= 0) {
+  const d = heartL.position.distanceTo(heartR.position);
+  if (d < MERGE_DISTANCE) {
+    const mid = heartL.position.clone().add(heartR.position).multiplyScalar(0.5);
+
+    // 用两颗主心当前大小做合体爆炸的动态倍率
+    const sizeMulFusion = clamp(
+      ((smoothScaleL / HEART_MEDIUM_L) + (smoothScaleR / HEART_MEDIUM_R)) * 0.5,
+      0.8,
+      3.6
     );
 
-    // 让爆炸更“散”：速度乘一个系数
-    vel.multiplyScalar(0.9);
+    burstAt(mid, 0xff2f6d, 320, sizeMulFusion);
+    burstAt(mid, 0xff5fd3, 320, sizeMulFusion);
 
-    addBrushHeart(heart.position.clone(), vel);
+    hideTimerL = MERGE_HIDE_SECONDS;
+    hideTimerR = MERGE_HIDE_SECONDS;
+
+    mergeCooldown = MERGE_HIDE_SECONDS + 0.35;
   }
 }
 
-}
-
-prevHeartPos.copy(heart.position);
-
-  safeUpdateBrush(dt);
-
+  updateBrush(dt);
   renderer.render(scene, cam3d);
 }
 
